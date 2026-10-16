@@ -15,6 +15,12 @@ information already printed on the checkout pages, so they're not secrets.
 State: fulfilled.json (txid -> delivery record) is committed back each run so a
 tx is never delivered twice. pending-manual-followup.json records order emails
 that can't be auto-fulfilled (missing txid or buyer email) so a human can reply.
+
+Optional repo secrets TELEGRAM_NOTIFY_TOKEN/TELEGRAM_NOTIFY_CHAT_ID (same bot
+Midas already uses to message the human) push a message on every real sale and
+on every new manual-followup case — without this, a sale or a stuck order would
+only be noticed if someone happened to read fulfilled.json/pending-manual-followup.json
+during an unrelated session.
 """
 import email
 import email.header
@@ -23,6 +29,7 @@ import json
 import os
 import re
 import smtplib
+import urllib.parse
 import urllib.request
 from email.mime.text import MIMEText
 from email.utils import parsedate_to_datetime
@@ -53,12 +60,14 @@ SELLER_EMAILS = {"kleogeos@gmail.com"}  # checkout pages tell buyers to email th
 
 def load_json(path):
     if os.path.exists(path):
-        return json.load(open(path))
+        with open(path) as f:
+            return json.load(f)
     return {}
 
 
 def save_json(path, d):
-    json.dump(d, open(path, "w"), indent=2)
+    with open(path, "w") as f:
+        json.dump(d, f, indent=2)
 
 
 def recent_usdt_transfers(limit=30):
@@ -127,6 +136,19 @@ def send_mail(to_addr, subject, body):
         s.sendmail(user, [to_addr], msg.as_string())
 
 
+def notify_human(text):
+    token = os.environ.get("TELEGRAM_NOTIFY_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_NOTIFY_CHAT_ID")
+    if not token or not chat_id:
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=15)
+    except Exception as e:  # noqa: BLE001 — a notify failure must never break fulfillment
+        print(f"[warn] telegram notify failed: {e}")
+
+
 def process_orders(orders, transfers, log, pending):
     """Pure decision logic, no I/O side effects beyond the log/pending dicts and the
     returned list of (buyer_email, name, amount, body) to actually send."""
@@ -175,6 +197,7 @@ def process_orders(orders, transfers, log, pending):
 def main():
     log = load_json(LOG_PATH)
     pending = load_json(PENDING_PATH)
+    pending_before = set(pending)
     transfers = recent_usdt_transfers()
     orders = recent_mail(40)
 
@@ -185,6 +208,12 @@ def main():
         log[txid] = {"email": buyer_email, "product": name, "amount": actual}
         sent.append((buyer_email, name, actual))
         print(f"[sent] {name} (${actual}) -> {buyer_email}")
+        notify_human(f"Sale! {name} (${actual} USDT) -> {buyer_email}")
+
+    for key in pending:
+        if key not in pending_before:
+            v = pending[key]
+            notify_human(f"Crypto order needs a manual reply ({v['reason']}): {v['subject']} from {v['from']}")
 
     save_json(LOG_PATH, log)
     save_json(PENDING_PATH, pending)
