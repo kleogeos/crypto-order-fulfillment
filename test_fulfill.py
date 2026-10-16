@@ -4,7 +4,9 @@ process_orders() is pure (takes orders/transfers/log/pending dicts, returns what
 to send) so the actual send_mail/IMAP side effects never need to run in tests."""
 import os
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fulfill  # noqa: E402
@@ -110,6 +112,53 @@ class TestProcessOrders(unittest.TestCase):
         to_send = fulfill.process_orders(orders, transfers, {}, pending)
         self.assertEqual(len(to_send), 1)
         self.assertEqual(pending, {})
+
+
+class TestMainNotifications(unittest.TestCase):
+    """main() does real I/O (mail, chain, smtp, telegram) — mock all of it and check
+    only the decision of *when* notify_human gets called, which is the actual bug
+    class worth guarding (silent sales / silently-stuck orders)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        fulfill.LOG_PATH = os.path.join(self.tmpdir, "fulfilled.json")
+        fulfill.PENDING_PATH = os.path.join(self.tmpdir, "pending-manual-followup.json")
+        self.notified = []
+        self.patchers = [
+            mock.patch.object(fulfill, "notify_human", side_effect=lambda t: self.notified.append(t)),
+            mock.patch.object(fulfill, "send_mail"),
+            mock.patch.object(fulfill, "recent_usdt_transfers", return_value={GOOD_TXID: 15.0}),
+        ]
+        for p in self.patchers:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in self.patchers])
+
+    def test_new_sale_triggers_one_notification(self):
+        with mock.patch.object(fulfill, "recent_mail", return_value=[{
+            "from": "Buyer <buyer@example.com>", "subject": "Starter Kit order",
+            "body": f"tx {GOOD_TXID}",
+        }]):
+            fulfill.main()
+        self.assertEqual(len(self.notified), 1)
+        self.assertIn("Sale!", self.notified[0])
+
+    def test_new_pending_order_triggers_one_notification(self):
+        with mock.patch.object(fulfill, "recent_mail", return_value=[{
+            "from": "Buyer <buyer@example.com>", "subject": "Starter Kit order",
+            "body": "no hash pasted",
+        }]):
+            fulfill.main()
+        self.assertEqual(len(self.notified), 1)
+        self.assertIn("manual reply", self.notified[0])
+
+    def test_already_known_pending_order_does_not_renotify(self):
+        order = {"from": "Buyer <buyer@example.com>", "subject": "Starter Kit order", "body": "no hash pasted"}
+        with mock.patch.object(fulfill, "recent_mail", return_value=[order]):
+            fulfill.main()
+        self.assertEqual(len(self.notified), 1)  # first run: notified once
+        with mock.patch.object(fulfill, "recent_mail", return_value=[order]):
+            fulfill.main()
+        self.assertEqual(len(self.notified), 1)  # second run, same stuck order: no new notification
 
 
 if __name__ == "__main__":
