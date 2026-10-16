@@ -23,8 +23,6 @@ import json
 import os
 import re
 import smtplib
-import sys
-import time
 import urllib.request
 from email.mime.text import MIMEText
 from email.utils import parsedate_to_datetime
