@@ -29,5 +29,32 @@ jobs:
           git config user.name "crypto-order-fulfillment"
           git config user.email "actions@users.noreply.github.com"
           git add fulfilled.json pending-manual-followup.json
-          git diff --cached --quiet || git commit -m "Update fulfillment state [skip ci]"
-          git push
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+            exit 0
+          fi
+          git commit -m "Update fulfillment state [skip ci]"
+          # A plain git push used to fail silently with 'fetch first' whenever
+          # main moved between this job's checkout and its push (e.g. a manual
+          # fix pushed elsewhere, or an overlapping run) - confirmed twice on
+          # 2026-10-16/17 (runs #1 and #11). "No new orders" meant nothing was
+          # lost those times, but if a real order's fulfilled.json update ever
+          # hit this same race, the next run would reprocess the same payment
+          # and send a duplicate delivery/notify. Retry with rebase instead of
+          # giving up after one push - same fix already applied to the sibling
+          # telegram-stars-bot workflow for the identical failure class.
+          for i in 1 2 3 4 5; do
+            if git push; then
+              exit 0
+            fi
+            echo "push rejected (attempt $i), rebasing onto latest origin/main"
+            git fetch origin main
+            if ! git rebase origin/main; then
+              git rebase --abort
+              echo "::error::rebase conflict on fulfilled.json/pending-manual-followup.json, giving up"
+              exit 1
+            fi
+            sleep 3
+          done
+          echo "::error::failed to push fulfillment state after 5 attempts"
+          exit 1
