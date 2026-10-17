@@ -51,15 +51,33 @@ class TestProcessOrders(unittest.TestCase):
         to_send = fulfill.process_orders(orders, {}, {}, {})
         self.assertEqual(to_send, [])
 
-    def test_wrong_amount_is_skipped(self):
+    def test_wrong_amount_is_not_sent_but_flagged_for_manual_followup(self):
         orders = [{
             "from": "Buyer <buyer@example.com>",
             "subject": "Starter Kit order",
             "body": f"tx {GOOD_TXID}",
         }]
         transfers = {GOOD_TXID: 3.0}  # way below the $15 Starter Kit price
-        to_send = fulfill.process_orders(orders, transfers, {}, {})
+        pending = {}
+        to_send = fulfill.process_orders(orders, transfers, {}, pending)
         self.assertEqual(to_send, [])
+        self.assertEqual(len(pending), 1)  # must not be silently dropped
+
+    def test_bundle_payment_under_wrong_subject_is_flagged_not_lost(self):
+        # Buyer paid the $25 bundle price but didn't know to write "Bundle order"
+        # as the subject, so it matches the $15 Starter Kit product instead and
+        # mismatches on amount. This must land in pending, not vanish silently.
+        orders = [{
+            "from": "Buyer <buyer@example.com>",
+            "subject": "Starter Kit order",
+            "body": f"tx {GOOD_TXID}",
+        }]
+        transfers = {GOOD_TXID: 25.0}
+        pending = {}
+        to_send = fulfill.process_orders(orders, transfers, {}, pending)
+        self.assertEqual(to_send, [])
+        self.assertEqual(len(pending), 1)
+        self.assertIn("25", next(iter(pending.values()))["reason"])
 
     def test_missing_txid_is_logged_for_manual_followup(self):
         orders = [{
