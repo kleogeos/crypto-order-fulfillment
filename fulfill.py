@@ -178,6 +178,19 @@ def process_orders(orders, transfers, log, pending):
         expected_amount, path, name = PRODUCTS[matched]
         actual = transfers[txid]
         if abs(actual - expected_amount) > AMOUNT_TOLERANCE:
+            # Previously this just skipped silently — a buyer who paid the bundle
+            # price (25) under a single-product subject (e.g. because they didn't
+            # know to write "Bundle order") would never get fulfilled AND never get
+            # flagged, since this branch recorded nothing anywhere. Flag it instead
+            # so a human can match it manually; it'll keep re-flagging harmlessly
+            # (same key, no duplicate notify) until a human clears/fixes it.
+            key = f"{o.get('from', '?')}|{o['subject']}"
+            if key not in pending:
+                pending[key] = {
+                    "from": o.get("from"), "subject": o["subject"],
+                    "reason": f"on-chain amount {actual} USDT doesn't match "
+                              f"'{matched}' price ({expected_amount} USDT) — txid {txid}",
+                }
             continue
 
         if matched == "bundle order":
