@@ -24,6 +24,7 @@ during an unrelated session.
 """
 import email
 import email.header
+import http.client
 import imaplib
 import json
 import os
@@ -33,6 +34,15 @@ import urllib.parse
 import urllib.request
 from email.mime.text import MIMEText
 from email.utils import parsedate_to_datetime
+
+# TronGrid/Gmail blips (RemoteDisconnected, timeouts, IMAP hiccups) must not
+# crash the whole run — the sibling telegram-stars-bot hit this same class of
+# transient-network exception 3 times (RemoteDisconnected isn't a URLError
+# subclass, so a narrower except missed it twice before). Here a crash is
+# lower-stakes (cron retries in 10 min either way), but letting the fetch
+# step raise uncaught still means a failed Action run and a delayed cycle
+# for no reason when the next retry would likely just work.
+TRANSIENT_NETWORK_ERRORS = (OSError, http.client.HTTPException, imaplib.IMAP4.error)
 
 ADDRESS = "TSDqzM1aAc5FKWUnmZQBtajLzgW7uneYhh"
 USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
@@ -211,14 +221,25 @@ def main():
     log = load_json(LOG_PATH)
     pending = load_json(PENDING_PATH)
     pending_before = set(pending)
-    transfers = recent_usdt_transfers()
-    orders = recent_mail(40)
+    try:
+        transfers = recent_usdt_transfers()
+        orders = recent_mail(40)
+    except TRANSIENT_NETWORK_ERRORS as e:
+        print(f"[warn] transient network error fetching transfers/mail, skipping this cycle: {e}")
+        return []
 
     to_send = process_orders(orders, transfers, log, pending)
     sent = []
     for buyer_email, name, actual, body, txid in to_send:
         send_mail(buyer_email, f"Your {name} download", body)
         log[txid] = {"email": buyer_email, "product": name, "amount": actual}
+        # Must persist right after this send, not just once at the end of the
+        # batch: if a later order in the same run raises (e.g. a transient
+        # SMTP error), the exception used to skip save_json() entirely, so
+        # this already-delivered txid would be missing from fulfilled.json —
+        # the next cron run (10 min later) would then re-match and re-send
+        # this same buyer a duplicate delivery for a product they already got.
+        save_json(LOG_PATH, log)
         sent.append((buyer_email, name, actual))
         print(f"[sent] {name} (${actual}) -> {buyer_email}")
         notify_human(f"Sale! {name} (${actual} USDT) -> {buyer_email}")
@@ -228,7 +249,6 @@ def main():
             v = pending[key]
             notify_human(f"Crypto order needs a manual reply ({v['reason']}): {v['subject']} from {v['from']}")
 
-    save_json(LOG_PATH, log)
     save_json(PENDING_PATH, pending)
     if not sent:
         print("No new orders to fulfill.")
