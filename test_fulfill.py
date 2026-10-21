@@ -3,6 +3,7 @@
 process_orders() is pure (takes orders/transfers/log/pending dicts, returns what
 to send) so the actual send_mail/IMAP side effects never need to run in tests."""
 import os
+import smtplib
 import sys
 import tempfile
 import unittest
@@ -178,6 +179,36 @@ class TestMainNotifications(unittest.TestCase):
             fulfill.main()
         self.assertEqual(len(self.notified), 1)  # second run, same stuck order: no new notification
 
+    def test_earlier_sale_in_batch_is_persisted_even_if_a_later_send_raises(self):
+        # Regression for a real bug: fulfilled.json used to be saved once at the
+        # very end of main(), after the whole send loop. If order #2's send_mail
+        # raised (e.g. a transient SMTP error), the exception skipped save_json()
+        # entirely — so order #1, already emailed successfully moments earlier,
+        # would be missing from fulfilled.json. The next cron run (10 min later)
+        # would then re-match order #1 and email that buyer a duplicate delivery
+        # for something they already received. Each send must persist immediately.
+        self.patchers[2].stop()  # replace the transfers-only mock with two txids
+        mock.patch.object(fulfill, "recent_usdt_transfers",
+                           return_value={GOOD_TXID: 15.0, OTHER_TXID: 9.0}).start()
+        orders = [
+            {"from": "Buyer1 <buyer1@example.com>", "subject": "Starter Kit order", "body": f"tx {GOOD_TXID}"},
+            {"from": "Buyer2 <buyer2@example.com>", "subject": "Prompt Pack order", "body": f"tx {OTHER_TXID}"},
+        ]
+        with mock.patch.object(fulfill, "recent_mail", return_value=orders), \
+             mock.patch.object(fulfill, "send_mail", side_effect=[None, smtplib.SMTPException("transient")]):
+            with self.assertRaises(smtplib.SMTPException):
+                fulfill.main()
+        log = fulfill.load_json(fulfill.LOG_PATH)
+        self.assertIn(GOOD_TXID, log)  # order #1's send succeeded and must be persisted
+        self.assertNotIn(OTHER_TXID, log)  # order #2's send never completed
+
+    def test_transient_network_error_fetching_is_skipped_without_crashing(self):
+        with mock.patch.object(fulfill, "recent_usdt_transfers",
+                                side_effect=ConnectionResetError("Connection reset by peer")):
+            result = fulfill.main()  # must not raise
+        self.assertEqual(result, [])
+
 
 if __name__ == "__main__":
     unittest.main()
+
